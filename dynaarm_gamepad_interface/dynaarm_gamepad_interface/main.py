@@ -33,6 +33,7 @@ from rclpy.node import Node
 
 from std_msgs.msg import Bool
 from sensor_msgs.msg import Joy
+from std_srvs.srv import Trigger
 
 from dynaarm_gamepad_interface.controller_manager import ControllerManager
 from dynaarm_gamepad_interface.utils.gamepad_feedback import GamepadFeedback
@@ -51,12 +52,16 @@ class GamepadInterface(Node):
         self.move_command_active = False  # Track if move_home or move_sleep was executed
         self.deadman_active = False  # Track deadman switch state
         self.last_deadman_state = False  # Track previous deadman state for edge detection
+        self.last_grasp_button_state = 0  # Track grasp button state for edge detection
 
         self.declare_parameter("mirror", mirror)
 
         # Publishers
         self.move_home_pub = self.create_publisher(Bool, "move_home", 10)
         self.move_sleep_pub = self.create_publisher(Bool, "move_sleep", 10)
+        
+        # Service Client for bag grasping
+        self.grasp_bag_client = self.create_client(Trigger, '/start_bag_grasping')
 
         # Subscribers
         self.create_subscription(Joy, "joy", self.joy_callback, 10)
@@ -135,6 +140,15 @@ class GamepadInterface(Node):
 
             return
 
+        # Deadman switch is active, check for grasp bag button first (edge trigger)
+        grasp_bag_button_index = self.button_mapping.get("grasp_bag", -1)
+        if grasp_bag_button_index >= 0:
+            current_grasp_state = msg.buttons[grasp_bag_button_index]
+            # Trigger on button press (rising edge)
+            if current_grasp_state == 1 and self.last_grasp_button_state == 0:
+                self.trigger_bag_grasping()
+            self.last_grasp_button_state = current_grasp_state
+        
         # Deadman switch is active, check for move commands
         move_home_pressed = msg.buttons[self.button_mapping["move_home"]]
         move_sleep_pressed = msg.buttons[self.button_mapping["move_sleep"]]
@@ -186,6 +200,28 @@ class GamepadInterface(Node):
                 current_controller.reset()
             else:
                 current_controller.process_input(msg)
+    
+    def trigger_bag_grasping(self):
+        """Trigger the bag grasping service."""
+        if not self.grasp_bag_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn("/start_bag_grasping service not available")
+            return
+        
+        request = Trigger.Request()
+        future = self.grasp_bag_client.call_async(request)
+        future.add_done_callback(self.grasp_service_callback)
+        self.get_logger().info("Triggering bag grasping...")
+    
+    def grasp_service_callback(self, future):
+        """Callback for grasp service response."""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f"Bag grasping started: {response.message}")
+            else:
+                self.get_logger().warn(f"Bag grasping failed: {response.message}")
+        except Exception as e:
+            self.get_logger().error(f"Service call failed: {e}")
 
 
 def main(args=None):

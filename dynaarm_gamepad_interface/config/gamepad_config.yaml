@@ -33,6 +33,7 @@ gamepad_node:
       wrist_rotation_right: 8
       switch_controller: 6  # Menu button for switching controllers
       gripper_control: 0
+      grasp_bag: 2  # Face Left button for triggering bag grasping
     axis_mapping:
       left_joystick:
         x: 0
