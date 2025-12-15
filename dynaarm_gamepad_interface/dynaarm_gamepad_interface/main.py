@@ -27,6 +27,8 @@ import os
 import threading
 import yaml
 import argparse
+import subprocess
+import time as time_module
 from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.node import Node
@@ -52,6 +54,7 @@ class GamepadInterface(Node):
         self.move_command_active = False  # Track if move_home or move_sleep was executed
         self.deadman_active = False  # Track deadman switch state
         self.last_deadman_state = False  # Track previous deadman state for edge detection
+        self.last_bag_grasping_button_state = 0  # Track bag grasping button state
         self.last_grasp_button_state = 0  # Track grasp button state for edge detection
 
         self.declare_parameter("mirror", mirror)
@@ -62,6 +65,10 @@ class GamepadInterface(Node):
         
         # Service Client for bag grasping
         self.grasp_bag_client = self.create_client(Trigger, '/start_bag_grasping')
+
+        # Service clients
+        self.bag_grasping_client = self.create_client(Trigger, '/start_bag_grasping')
+        self.bag_grasping_process = None  # Track subprocess
 
         # Subscribers
         self.create_subscription(Joy, "joy", self.joy_callback, 10)
@@ -109,6 +116,25 @@ class GamepadInterface(Node):
         with self.joy_lock:
             self.latest_joy_msg = msg
 
+    def _bag_grasping_callback(self, future):
+        """Callback for bag grasping service response."""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f"✅ Bag grasping completed: {response.message}")
+            else:
+                self.get_logger().warn(f"❌ Bag grasping failed: {response.message}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Bag grasping service call failed: {e}")
+        finally:
+            # Terminate the node subprocess now that service is complete
+            if self.bag_grasping_process and self.bag_grasping_process.poll() is None:
+                self.get_logger().info("Terminating bag grasping node...")
+                self.bag_grasping_process.kill()  # Force kill immediately
+                self.bag_grasping_process.wait(timeout=1.0)  # Wait for process to die
+                self.bag_grasping_process = None
+                self.get_logger().info("Node terminated successfully")
+
     def process_joy_input(self):
         """Process latest joystick input."""
         with self.joy_lock:
@@ -140,15 +166,6 @@ class GamepadInterface(Node):
 
             return
 
-        # Deadman switch is active, check for grasp bag button first (edge trigger)
-        grasp_bag_button_index = self.button_mapping.get("grasp_bag", -1)
-        if grasp_bag_button_index >= 0:
-            current_grasp_state = msg.buttons[grasp_bag_button_index]
-            # Trigger on button press (rising edge)
-            if current_grasp_state == 1 and self.last_grasp_button_state == 0:
-                self.trigger_bag_grasping()
-            self.last_grasp_button_state = current_grasp_state
-        
         # Deadman switch is active, check for move commands
         move_home_pressed = msg.buttons[self.button_mapping["move_home"]]
         move_sleep_pressed = msg.buttons[self.button_mapping["move_sleep"]]
@@ -188,6 +205,41 @@ class GamepadInterface(Node):
         if self.last_menu_button_state:
             # TODO Hold current position?
             return
+
+        # Handle bag grasping button (Square button) - launch node on-demand
+        bag_grasping_index = self.button_mapping["bag_grasping"]
+        if msg.buttons[bag_grasping_index] == 1 and self.last_bag_grasping_button_state == 0:
+            self.get_logger().info("🤖 Bag grasping button pressed! Launching node on-demand...")
+            
+            # Launch the node in a subprocess
+            if self.bag_grasping_process is None or self.bag_grasping_process.poll() is not None:
+                try:
+                    self.bag_grasping_process = subprocess.Popen(
+                        ['ros2', 'run', 'swiss_robotics_day_demo', 'move_joint_positions_node'],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    self.get_logger().info("Node launched, waiting for service...")
+                    
+                    # Wait for service to become available (max 3 seconds)
+                    for i in range(50):
+                        if self.bag_grasping_client.service_is_ready():
+                            self.get_logger().info("Service ready! Calling bag grasping...")
+                            future = self.bag_grasping_client.call_async(Trigger.Request())
+                            future.add_done_callback(self._bag_grasping_callback)
+                            break
+                        time_module.sleep(0.1)
+                    else:
+                        self.get_logger().error("Service did not become available in time")
+                        if self.bag_grasping_process:
+                            self.bag_grasping_process.terminate()
+                            self.bag_grasping_process = None
+                except Exception as e:
+                    self.get_logger().error(f"Failed to launch node: {e}")
+            else:
+                self.get_logger().warn("Bag grasping already in progress")
+        
+        self.last_bag_grasping_button_state = msg.buttons[bag_grasping_index]
 
         self.controller_manager.gripper_controller.process_input(msg)
 

@@ -31,9 +31,8 @@ gamepad_node:
       dead_man_switch: 10
       wrist_rotation_left: 7
       wrist_rotation_right: 8
-      switch_controller: 6  # Menu button for switching controllers
-      gripper_control: 0
-      grasp_bag: 2  # Face Left button for triggering bag grasping
+      switch_controller: 6  # Menu button for switching controllers      
+      bag_grasping: 2  # Face Left (Square button)
     axis_mapping:
       left_joystick:
         x: 0
