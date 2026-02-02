@@ -30,18 +30,19 @@ from dynaarm_gamepad_interface.controllers.base_controller import BaseController
 from dynaarm_extensions.duatic_helpers.duatic_marker_helper import DuaticMarkerHelper
 from dynaarm_extensions.duatic_helpers.duatic_pinocchio_helper import DuaticPinocchioHelper
 
-
 class CartesianController(BaseController):
     """Handles Cartesian control mode and publishes a visualization marker."""
 
     def __init__(self, node, duatic_robots_helper):
         super().__init__(node, duatic_robots_helper)
 
+        self.last_time = None
+        
         self.node.get_logger().info("Initializing cartesian controller.")
 
         self.ee_frame = "flange"
         self.current_pose = None
-        self.scale = 0.05
+        self.scale = 1.0
         self.mirror = self.node.get_parameter("mirror").get_parameter_value().bool_value
 
         self.needed_low_level_controllers = [
@@ -69,7 +70,7 @@ class CartesianController(BaseController):
             self.base_frame = "tbase"
             self.pin_helper = DuaticPinocchioHelper(self.node, robot_type="Alpha")
         else:
-            self.base_frame = "world"
+            self.base_frame = "base_link"
             self.pin_helper = DuaticPinocchioHelper(self.node)
 
         self.marker_helper = DuaticMarkerHelper(self.node)
@@ -101,11 +102,27 @@ class CartesianController(BaseController):
         """Processes joystick input and updates Cartesian position for all arms."""
         super().process_input(msg)
 
+
+        current_time = self.node.get_clock().now()
+        if self.last_time is None:
+            self.last_time = current_time
+        dt_duration = current_time - self.last_time
+        dt = dt_duration.nanoseconds / 1e9
+        self.last_time = current_time
+
+        # Safety: If dt is huge (e.g. first run or after a long pause), 
+        # clamp it to avoid a massive jump.
+        if dt > 0.1:
+            dt = 0.0
+
         # Initialize poses if not already done
         first_topic = list(self.topic_to_commanded_poses.keys())[0]
         if self.topic_to_commanded_poses[first_topic].header.frame_id == "":
             print("Resetting poses...")
             self.reset()
+
+        # Add a small deadzone to prevent drift when joystick is neutral
+        deadzone = 0.02
 
         # Get input values
         x = msg.axes[self.node.axis_mapping["left_joystick"]["y"]]
@@ -119,24 +136,12 @@ class CartesianController(BaseController):
             msg.axes[self.node.axis_mapping["triggers"]["right"]] > 0.5
         )
 
-        # Prioritization logic
-        if abs(pitch) > 1e-4:
-            lx, ly = 0.0, 0.0
-        elif abs(x) > abs(y) and abs(x) > 1e-4:
-            lx, ly = x, 0.0
-        elif abs(y) > 1e-4:
-            lx, ly = 0.0, y
-        else:
-            lx, ly = 0.0, 0.0
+        # Apply Deadzone
+        lx = x if abs(x) > deadzone else 0.0
+        ly = y if abs(y) > deadzone else 0.0
+        lz = z if abs(z) > deadzone else 0.0
+        d_roll = roll if abs(roll) > deadzone else 0.0
 
-        if abs(pitch) > 1e-4:
-            lz, d_roll = 0.0, 0.0
-        elif abs(z) > abs(roll) and abs(z) > 1e-4:
-            lz, d_roll = z, 0.0
-        elif abs(roll) > 1e-4:
-            lz, d_roll = 0.0, roll
-        else:
-            lz, d_roll = 0.0, 0.0
 
         # Scaling
         linear_speed = 0.2
@@ -169,14 +174,15 @@ class CartesianController(BaseController):
                 mirror_yaw = yaw
 
             # Update Position
-            current_pose.pose.position.x += mirror_lx * linear_speed * self.scale
-            current_pose.pose.position.y += mirror_ly * linear_speed * self.scale
-            current_pose.pose.position.z += mirror_lz * linear_speed * self.scale
+            current_pose.pose.position.x += mirror_lx * linear_speed * self.scale * dt
+            current_pose.pose.position.y += mirror_ly * linear_speed * self.scale * dt
+            current_pose.pose.position.z += mirror_lz * linear_speed * self.scale * dt
+
 
             # Update Orientation (Apply Incremental Rotations)
-            d_roll_scaled = mirror_d_roll * angular_speed * self.scale
-            pitch_scaled = mirror_pitch * angular_speed * self.scale
-            yaw_scaled = mirror_yaw * angular_speed * self.scale
+            d_roll_scaled = mirror_d_roll * angular_speed * self.scale * dt
+            pitch_scaled = mirror_pitch * angular_speed * self.scale * dt
+            yaw_scaled = mirror_yaw * angular_speed * self.scale * dt
 
             q_roll = quaternion_from_euler(d_roll_scaled, 0, 0)
             q_pitch = quaternion_from_euler(0, pitch_scaled, 0)
